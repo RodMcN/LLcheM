@@ -1,93 +1,49 @@
 import config
 import torch
-from inspect import getmembers
-import math as maths
 from model import Model, SinusoidalPosEmbedding, TrainablePosEmbedding
 from data import get_dataloaders
 from tqdm.auto import tqdm
-import torch.nn.functional as F
 from data import download_zinc20
 import os
+from train_utils import get_optimiser, LinearWarmupCosineDecay
 
-def get_optimiser(name: str, model: torch.nn.Module, learning_rate: float, weight_decay: float, **kwargs):
-    opt = None
-    for n, obj in getmembers(torch.optim):
-        if name == n:
-            opt = obj
-            break
-    if opt is None:
-        raise AttributeError(f"Optimiser {name} doesn't exist")
-    
-    params = [p for p in model.parameters() if p.requires_grad]
-    groups = [
-        {'params': [p for p in params if p.dim() >= 2], 'weight_decay': weight_decay},
-        {'params': [p for p in params if p.dim() < 2], 'weight_decay': 0.0}
-    ]
-
-    if "Adam" in name and "betas" not in kwargs:
-        kwargs['betas'] = (0.9, 0.95)
-    opt = opt(groups, lr=learning_rate, **kwargs)
-
-    return opt
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+from contextlib import nullcontext
 
 
-class LinearWarmupCosineDecay:
-    def __init__(self, optimiser, warmup_steps, decay_steps, lr_gamma=0.9, decay_gamma=0.5):
-        self.optimiser = optimiser
-        
-        self.current_step = 1
-        self.warmup_steps = warmup_steps
-        self.decay_steps = decay_steps
-        self.lr_gamma = lr_gamma
-        self.decay_gamma = decay_gamma
-
-        self.max_lrs = [pg['lr'] for pg in optimiser.param_groups]
-
-    def get_lr_scale(self):
-        if self.current_step < self.warmup_steps:
-            return 1 / (self.warmup_steps / self.current_step)
-        else:
-            return (1 + maths.cos(maths.pi * ((self.current_step - self.warmup_steps) * (1 / self.decay_steps)))) / 2
-
-    def step(self):
-        self.current_step += 1
-        if self.current_step > (self.warmup_steps + self.decay_steps):
-            self.current_step = 1
-            if self.lr_gamma:
-                self.max_lrs = [lr * self.lr_gamma for lr in self.max_lrs]
-            if self.decay_gamma:
-                self.decay_steps *= 1 + (1 - self.decay_gamma)
-
-        lr_scale = self.get_lr_scale()
-        self.scale_lrs(lr_scale)
-    
-    def scale_lrs(self, lr_scale):
-        for param_group, max_lr in zip(self.optimiser.param_groups, self.max_lrs):
-            param_group['lr'] = max_lr * lr_scale
-
-    def set_lrs(self, lr):
-        if isinstance(lr, list):
-            for param_group, val in zip(self.optimiser.param_groups, lr):
-                param_group['lr'] = val
-        else:
-            for param_group in self.optimiser.param_groups:
-                param_group['lr'] = lr
+def step(model, x, y, mask, padding, loss_fn, device):
+    x = x.to(device, non_blocking=True)
+    y = y.to(device)
+    preds = model(x, padding_mask=padding.to(device), prediction_mask=mask.to(device))
+    loss = loss_fn(preds, y)
+    return loss
 
 
 def train():
-    set_seed()
-    device = "cuda" if torch.cuda.is_available() and config.n_gpu > 0 else "cpu"
+    ### Setup
+    if config.n_gpu > 1:
+        assert torch.cuda.is_available()
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        print(f"Starting DDP on rank {rank}.")
+    else:
+        rank = 0
+    set_seed(42 + rank)
+
+    device = rank if torch.cuda.is_available() and config.n_gpu > 0 else "cpu"
+    is_cuda = device != "cpu"
+    device_type = "cuda" if is_cuda else "cpu"
     autocast = config.mixed_precision
     accumulation_steps = config.accumulation_steps
     grad_clip = config.grad_clip
-    batch_size =config.batch_size
+    batch_size = int(config.effective_batch_size / config.n_gpu / config.accumulation_steps)
+    print(f"{batch_size=}, {config.effective_batch_size=}, {config.n_gpu=}, {config.accumulation_steps=}")
     
-    ### Setup
-
     train_loader, val_loader, vocab, tokens = get_dataloaders(config.dataset_path, 
-                                                      train_args=dict(num_workers=config.num_workers, batch_size=batch_size, pin_memory=config.n_gpu > 0))
+                                                      train_args=dict(num_workers=config.num_workers, batch_size=batch_size, pin_memory=config.n_gpu > 0),
+                                                      test_args=dict(num_workers=8, batch_size=config.eval_batch_size))
 
-    # compile?
     model = Model(vocab, 
                   embed_dim=config.embed_dim,
                   num_embeddings=len(vocab),
@@ -98,9 +54,16 @@ def train():
                   pos_encoding_layer=None,#TrainablePosEmbedding(config.embed_dim, 1000),
                   rotary_embeddings=True).to(device)
     
-    print(model)
+    # print(model)
     print(f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters")
-    model = torch.compile(model, dynamic=True)
+    if config.n_gpu < 2:
+        # TODO compile not working with DDP, maybe related to dynamic batch sizes
+        model = torch.compile(model, dynamic=True)
+    if config.n_gpu > 1:
+        model = DDP(model, device_ids=[rank])
+        ddp_no_sync = model.no_sync
+    else:
+        ddp_no_sync = nullcontext
 
     if autocast:
         print("Using mixed precision")
@@ -108,11 +71,11 @@ def train():
 
     opt = config.optimiser
     opt_args = {}
-    if "cuda" in device and "Adam" in opt:
+    if is_cuda and "Adam" in opt:
         opt_args["fused"] = True
     opt = get_optimiser(opt, model, config.learning_rate, config.weight_decay, **opt_args)
     
-    lr_warmup_steps = config.lr_warmup_steps // (batch_size * accumulation_steps)
+    lr_warmup_steps = config.lr_warmup_steps# // (batch_size * accumulation_steps)
     scheduler = LinearWarmupCosineDecay(opt, lr_warmup_steps, config.lr_decay_step, lr_gamma=0.8, decay_gamma=0.1)
 
     if config.use_weighted_loss:
@@ -123,29 +86,38 @@ def train():
         weights = None
     loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
 
-
     ### Training
-    
-    n_epochs = config.n_epochs
     best_loss = 1e6
     rounds_since_improvement = 0
+    train_iterator = iter(train_loader)
+    total_iters = 0
+    while True:
+        
+        n_microbatches = (config.eval_every_n_updates * accumulation_steps) // config.n_gpu
+        if total_iters + config.eval_every_n_updates > config.max_train_updates:
+            n_microbatches = (config.max_train_updates - total_iters) * accumulation_steps
 
-    for epoch in range(config.n_epochs):
-        ### Train ###
+        steps = range(1, n_microbatches + 1)
+        if rank == 0:
+            print(f"Completed {total_iters}/{config.max_train_updates} Training steps")
+            steps = tqdm(steps)
+        
+        ### TRAIN ###
         model.train()
         running_loss = 0
-
-        progress = tqdm(enumerate(train_loader, 1), total=len(train_loader))
-        for batch_idx, batch in progress:
-            with torch.autocast(device, enabled=autocast):
-                loss = model.step(*batch, loss_fn, device) / accumulation_steps
+        iters_since_eval = 0
+        for batch_idx in steps:
+            batch = next(train_iterator)
+            with torch.autocast(device_type=device_type, enabled=autocast):
+                loss = step(model, *batch, loss_fn, device) / accumulation_steps
                 running_loss += loss.item()
                 if autocast:
                     grad_scaler.scale(loss).backward()
                 else:
                     loss.backward()
-
+    
             if batch_idx % accumulation_steps == 0:
+                # TODO if doing gradient accumulation and DDP, only need to sync models/GPUs here
                 if grad_clip:
                     if autocast: grad_scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -156,35 +128,57 @@ def train():
                     opt.step()
                 opt.zero_grad(set_to_none=True)
                 scheduler.step()
-                progress.set_description(f"Epoch {epoch}/{n_epochs} | Train | Loss={running_loss / batch_idx:.4f}")
-        opt.zero_grad(set_to_none=True)
-        progress.close()
 
-        ### EVAL ###
-        model.eval()
-        running_loss = 0
-        with torch.no_grad():
-            progress = tqdm(enumerate(val_loader, 1), total=len(val_loader))
-            for batch_idx, batch in progress:
-                with torch.autocast(device, enabled=autocast):
-                    loss = model.step(*batch, loss_fn, device) / accumulation_steps
-                    running_loss += loss.item()
-                    progress.set_description(f"Epoch {epoch}/{n_epochs} | Val | Loss={running_loss / batch_idx:.4f}")
-            progress.close()
+                if rank == 0:
+                    steps.set_description(f"Train batch {batch_idx}/{n_microbatches} | Loss={running_loss / batch_idx:.4f}")
+                iters_since_eval += 1
+                total_iters += 1
+                
+        opt.zero_grad(set_to_none=True)
+        if rank == 0:
+            steps.close()
         
+        ### EVAL ###
+
+        model.eval()
+        # if rank == 0:
+        running_loss = 0
+        with torch.no_grad(), ddp_no_sync():
+            loader = enumerate(val_loader, 1)
+            if rank == 0:
+                loader = tqdm(loader, total=len(val_loader), desc="Evaluating")
+            for batch_idx, batch in loader:
+                # no need to sync
+                with torch.autocast(device_type=device_type, enabled=autocast):
+                    loss = step(model, *batch, loss_fn, device) / accumulation_steps
+                    running_loss += loss.item()
+
+        # if last batch is smaller, val_loss will be incorrect, but difference is insignificant        
         val_loss = running_loss / batch_idx
+        if config.n_gpu > 1:
+            # Average val loss over GPUs
+            print(f"Val loss before reduce = {val_loss}. Rank = {rank}")
+            val_loss = torch.tensor(val_loss).to(rank)
+            dist.all_reduce(val_loss, op=dist.ReduceOp.SUM)
+            val_loss = val_loss.item() / config.n_gpu
+            print(f"Val loss after reduce = {val_loss}. Rank = {rank}")
+
         if val_loss < best_loss:
             best_loss = val_loss
             rounds_since_improvement = 0
-            print(f"\033[92mNew best loss: {val_loss:.4f}\033[0m")
-            if config.model_path:
-                save_model(model)
+            if rank == 0:
+                print(f"\033[92mNew best loss: {val_loss:.4f}\033[0m")
+                if config.model_path and rank == 0:
+                    save_model(model)
         else:
             rounds_since_improvement += 1
             print(f"Loss not improved for {rounds_since_improvement} epochs")
             if config.early_stopping_rounds and rounds_since_improvement > config.early_stopping_rounds:
-                print("Stopping")
+                print(f"Stopping ({rank=})")
                 break
+        if total_iters >= config.max_train_updates:
+            print(f"Training finished. Stopping ({rank=})")
+            break
         print()
 
 
@@ -211,3 +205,5 @@ def set_seed(seed=42):
 if __name__ == "__main__":
     # download_zinc20(config.dataset_path, config.dataset_path, 1)
     train()
+
+#  torchrun --standalone --nproc_per_node=2 train.py

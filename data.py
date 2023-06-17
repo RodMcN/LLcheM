@@ -12,7 +12,7 @@ from multiprocessing import Pool
 import os
 
 
-class Dataset(torch.utils.data.Dataset):
+class DatasetBase:
     def __init__(self, x, vocab, pad_tok="<pad>", mask_tok="<mask>", 
                  mask_freq=0.15, revert_mask_freq=0.1, random_mask_freq=0.1):
         
@@ -25,12 +25,12 @@ class Dataset(torch.utils.data.Dataset):
         self.mask_tok = vocab([mask_tok])[0]
         self.toks = torch.LongTensor([v for k, v in vocab.get_stoi().items() if k not in [pad_tok, mask_tok]])
         
-    def __len__(self):
-        return len(self.x)
+    # def __len__(self):
+    #     return len(self.x)
     
-    def __getitem__(self, idx):
-        x = self.x[idx]
-        return x
+    # def __getitem__(self, idx):
+    #     x = self.x[idx]
+    #     return x
     
     def collate_fn(self, batch):
         max_len = max([len(x) for x in batch])
@@ -58,6 +58,25 @@ class Dataset(torch.utils.data.Dataset):
         
         return x, y, mask, padding
 
+
+class MapDataset(DatasetBase, torch.utils.data.Dataset):
+    def __len__(self):
+        return len(self.x)
+    
+    def __getitem__(self, idx):
+        x = self.x[idx]
+        return x
+
+
+class InfiniteDataset(DatasetBase, torch.utils.data.IterableDataset):
+    def __iter__(self):
+        logged = False
+        while True:
+            item = random.choice(self.x)
+            # if not logged:
+            #     print("Chose", item)
+            #     logged = True
+            yield item
 
 
 def load_zinc20(datapath=None, train_split=0.9, dev=True):
@@ -105,8 +124,10 @@ def load_zinc20_smiles(datapath=None, train_split=0.9, dev=True):
     
     if dev:
         # use 10% of the dataset for dev
-        train_files = train_files[:len(train_files) // 10]
-        val_files = val_files[:len(val_files) // 10]
+        # train_files = train_files[:len(train_files) // 10]
+        # val_files = val_files[:len(val_files) // 10]
+        train_files = train_files[:10]
+        val_files = val_files[:2]
         
     def load_files(files):
         rows = []
@@ -178,13 +199,16 @@ def get_dataloaders(path, pad_tok="<pad>", mask_tok="<mask>", oov_tok="<unk>", d
     vocab.set_default_index(vocab[oov_tok])
     
     print("Generating dataset")
-    train_dataset = Dataset(x_train, vocab, pad_tok, mask_tok, **(dataset_kwargs or {}))
-    val_dataset = Dataset(x_val, vocab, pad_tok, mask_tok, **(dataset_kwargs or {}))
+    train_dataset = InfiniteDataset(x_train, vocab, pad_tok, mask_tok, **(dataset_kwargs or {}))
+    val_dataset = MapDataset(x_val, vocab, pad_tok, mask_tok, **(dataset_kwargs or {}))
 
     train_dataloader_kwargs = train_args or {}
     test_dataloader_kwargs = test_args or {}
 
     train_defaults = {"num_workers": 8, "batch_size": 16, "prefetch_factor": 2, "persistent_workers": True}
+    if isinstance(train_dataset, MapDataset):
+        train_defaults["shuffle"] = True
+
     val_defaults = {"batch_size": 16}
     for k, v in train_defaults.items():
         if k not in train_dataloader_kwargs:
@@ -194,7 +218,9 @@ def get_dataloaders(path, pad_tok="<pad>", mask_tok="<mask>", oov_tok="<unk>", d
             test_dataloader_kwargs[k] = v
         
     print("Generating dataloaders")
-    train_loader = torch.utils.data.DataLoader(train_dataset, shuffle=True, collate_fn=train_dataset.collate_fn, **train_dataloader_kwargs)
+    print("Train:", train_dataloader_kwargs)
+    print("Test:", test_dataloader_kwargs)
+    train_loader = torch.utils.data.DataLoader(train_dataset, collate_fn=train_dataset.collate_fn, **train_dataloader_kwargs)
     val_loader = torch.utils.data.DataLoader(val_dataset, collate_fn=val_dataset.collate_fn, **test_dataloader_kwargs)
 
     return train_loader, val_loader, vocab, token_freqs
