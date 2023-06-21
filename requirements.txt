@@ -1,0 +1,2 @@
+pytorch>=2
+pytorch-cuda=11.7

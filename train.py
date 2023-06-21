@@ -42,7 +42,7 @@ def train():
     
     train_loader, val_loader, vocab, tokens = get_dataloaders(config.dataset_path, 
                                                       train_args=dict(num_workers=config.num_workers, batch_size=batch_size, pin_memory=config.n_gpu > 0),
-                                                      test_args=dict(num_workers=8, batch_size=config.eval_batch_size))
+                                                      test_args=dict(num_workers=8, batch_size=config.eval_batch_size), distributed=config.n_gpu > 1)
 
     model = Model(vocab, 
                   embed_dim=config.embed_dim,
@@ -121,6 +121,7 @@ def train():
                 if grad_clip:
                     if autocast: grad_scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                
                 if autocast:
                     grad_scaler.step(opt)
                     grad_scaler.update()
@@ -143,12 +144,12 @@ def train():
         model.eval()
         # if rank == 0:
         running_loss = 0
+        # no need to sync models during evaluation
         with torch.no_grad(), ddp_no_sync():
             loader = enumerate(val_loader, 1)
             if rank == 0:
                 loader = tqdm(loader, total=len(val_loader), desc="Evaluating")
             for batch_idx, batch in loader:
-                # no need to sync
                 with torch.autocast(device_type=device_type, enabled=autocast):
                     loss = step(model, *batch, loss_fn, device) / accumulation_steps
                     running_loss += loss.item()
@@ -180,6 +181,9 @@ def train():
             print(f"Training finished. Stopping ({rank=})")
             break
         print()
+    
+    if config.n_gpu > 1:
+        dist.destroy_process_group()
 
 
 def save_model(model):
@@ -194,10 +198,11 @@ def save_model(model):
         torch.save(model, model_path)
 
 def set_seed(seed=42):
-    # random.seed(seed)
-    # os.environ['PYTHONHASHSEED'] = str(seed)
-    # np.random.seed(seed)
-    # call with offset for ddp
+    import random
+    import numpy as np
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 

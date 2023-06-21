@@ -185,7 +185,7 @@ def get_vocab(x: list, specials: list, min_freq: int = 10):
     return vocab, token_freqs
 
 
-def get_dataloaders(path, pad_tok="<pad>", mask_tok="<mask>", oov_tok="<unk>", dataset_kwargs=None, train_args=None, test_args=None):
+def get_dataloaders(path, pad_tok="<pad>", mask_tok="<mask>", oov_tok="<unk>", dataset_kwargs=None, train_args=None, test_args=None, distributed=False):
     # x_train, x_val = load_zinc20(path)
     print("Loading data")
     x_train, x_val = load_zinc20_smiles(path)
@@ -221,7 +221,11 @@ def get_dataloaders(path, pad_tok="<pad>", mask_tok="<mask>", oov_tok="<unk>", d
     print("Train:", train_dataloader_kwargs)
     print("Test:", test_dataloader_kwargs)
     train_loader = torch.utils.data.DataLoader(train_dataset, collate_fn=train_dataset.collate_fn, **train_dataloader_kwargs)
-    val_loader = torch.utils.data.DataLoader(val_dataset, collate_fn=val_dataset.collate_fn, **test_dataloader_kwargs)
+    # If using DDP, create a DistributedSampler to split the Val set across GPUs.
+    # Train set is using InfiniteDataset so no need for sampler on the train set
+    val_sampler = torch.utils.data.distributed.DistributedSampler(x_val) if distributed else None
+
+    val_loader = torch.utils.data.DataLoader(val_dataset, collate_fn=val_dataset.collate_fn, **test_dataloader_kwargs, sampler=val_sampler)
 
     return train_loader, val_loader, vocab, token_freqs
 
