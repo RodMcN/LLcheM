@@ -1,7 +1,7 @@
 import torch
 from pathlib import Path
 import random
-import pandas as pd
+# import pandas as pd
 import selfies as sf
 from multiprocessing import Pool
 import re
@@ -124,8 +124,8 @@ def load_zinc20_smiles(datapath=None, train_split=0.9, dev=True):
     
     if dev:
         # use 10% of the dataset for dev
-        # train_files = train_files[:len(train_files) // 10]
-        # val_files = val_files[:len(val_files) // 10]
+        # train_files = train_files[:len(train_files) // 20]
+        # val_files = val_files[:len(val_files) // 20]
         train_files = train_files[:10]
         val_files = val_files[:2]
         

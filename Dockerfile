@@ -12,8 +12,10 @@ RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-${CONDA_VERSION}-Linu
 
 RUN mkdir LLcheM
 WORKDIR /LLcheM
+RUN pip3 install torch>=2 torchtext --index-url https://download.pytorch.org/whl/cu117
 COPY requirements.txt .
-RUN conda install -y --file requirements.txt -c pytorch -c nvidia
+# RUN conda install -y --file requirements.txt -c pytorch -c nvidia -c conda-forge
+RUN pip install -r requirements.txt
 
 COPY *.py .
 ENTRYPOINT ["python", "run_training.py"]

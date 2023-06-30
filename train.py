@@ -6,6 +6,8 @@ from tqdm.auto import tqdm
 from data import download_zinc20
 import os
 from train_utils import get_optimiser, LinearWarmupCosineDecay
+from logger import Logger
+
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
@@ -30,6 +32,7 @@ def train():
     else:
         rank = 0
     set_seed(42 + rank)
+    logger = Logger(tensorbard_dir=config.tensorboard_dir)
 
     device = rank if torch.cuda.is_available() and config.n_gpu > 0 else "cpu"
     is_cuda = device != "cpu"
@@ -71,6 +74,7 @@ def train():
 
     opt = config.optimiser
     opt_args = {}
+    # Use the fused implementation for Adam and Adam variants
     if is_cuda and "Adam" in opt:
         opt_args["fused"] = True
     opt = get_optimiser(opt, model, config.learning_rate, config.weight_decay, **opt_args)
@@ -138,6 +142,7 @@ def train():
         opt.zero_grad(set_to_none=True)
         if rank == 0:
             steps.close()
+            logger.add_scalar("Loss/train", running_loss / batch_idx, total_iters)
         
         ### EVAL ###
 
@@ -164,14 +169,21 @@ def train():
             val_loss = val_loss.item() / config.n_gpu
             print(f"Val loss after reduce = {val_loss}. Rank = {rank}")
 
+        # Log metrics
+        if rank == 0:
+            logger.add_scalar("Loss/val", val_loss, total_iters)
+            logger.add_scalar("LR", opt.param_groups[0]['lr'], total_iters)
+
         if val_loss < best_loss:
             best_loss = val_loss
             rounds_since_improvement = 0
             if rank == 0:
+                # Save model if validation loss has improved
                 print(f"\033[92mNew best loss: {val_loss:.4f}\033[0m")
                 if config.model_path and rank == 0:
                     save_model(model)
         else:
+            # Early stopping
             rounds_since_improvement += 1
             print(f"Loss not improved for {rounds_since_improvement} epochs")
             if config.early_stopping_rounds and rounds_since_improvement > config.early_stopping_rounds:
@@ -187,6 +199,8 @@ def train():
 
 
 def save_model(model):
+    if config.n_gpu > 1:
+        model = model.module
     model_path = config.model_path
     # if not model_path.endswith(".pt") or model_path.endswith(".pth"):
     #     model_path = os.path.join(model_path, "model.pt")
