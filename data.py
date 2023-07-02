@@ -15,7 +15,11 @@ import os
 class DatasetBase:
     def __init__(self, x, vocab, pad_tok="<pad>", mask_tok="<mask>", 
                  mask_freq=0.15, revert_mask_freq=0.1, random_mask_freq=0.1):
-        
+        """
+        :param mask_freq: proportion of token that are masked
+        :param revert_mask_freq: proportion of the masked tokens that are kept as the original token
+        :param random_mask_freq: tproportion of he masked tokens that are replaced with random tokens
+        """
         # self.batch_size = batch_size
         self.mask_freq = mask_freq
         self.revert_mask_freq = revert_mask_freq
@@ -190,6 +194,7 @@ def get_dataloaders(path, pad_tok="<pad>", mask_tok="<mask>", oov_tok="<unk>", d
     print("Loading data")
     x_train, x_val = load_zinc20_smiles(path)
     print(f"{len(x_train):,} Train examples. {len(x_val):,} Val examples.")
+    print(f"{sum([len(x) for x in x_train]):,} Train tokens")
     
     # x_train = smiles_to_selfies(x_train['smiles'])
     # x_val = smiles_to_selfies(x_val['smiles'])
@@ -253,7 +258,7 @@ def _download(args):
 
 
 def process1(file):
-    out_file = file.replace("LLcheM/zinc20/", "LLcheM/SELFIES/")
+    out_file = file.replace("/zinc20/", "/SELFIES/")
     if os.path.exists(out_file):
         return
 
@@ -275,7 +280,6 @@ def process1(file):
         for line in processed:
             outfile.write(line)
             outfile.write("\n")
-
 
 def download_zinc20(tranches_file_path, dest_path, processes):
     # TODO: add POST request to https://zinc20.docking.org/tranches/download

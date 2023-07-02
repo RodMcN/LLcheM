@@ -3,6 +3,7 @@ from torch import nn
 import math
 import torch.nn.functional as F
 from einops import rearrange
+import selfies as sf
 
 
 class Model(nn.Module):
@@ -15,13 +16,27 @@ class Model(nn.Module):
                  num_attn_heads, 
                  num_encoder_layers, 
                  pos_encoding_layer=None, 
+                 max_input_len=None,
                  rotary_embeddings=False):
 
         super().__init__()
         self.vocab = vocab
+        
+        self.embed_dim = embed_dim
+        self.num_embeddings = num_embeddings
+        self.embed_padding_idx = embed_padding_idx
+        self.num_outputs = num_outputs
+        self.num_attn_heads = num_attn_heads
+        self.num_encoder_layers = num_encoder_layers
+        self.rotary_embeddings = rotary_embeddings
+        self.max_input_len = max_input_len
 
-        self.pos_encoding_layer = pos_encoding_layer
-        assert not (rotary_embeddings and pos_encoding_layer)
+        assert not (rotary_embeddings and pos_encoding_layer)   
+        if pos_encoding_layer == "TrainablePosEmbedding":
+            pos_encoding_layer = TrainablePosEmbedding(embed_dim, max_input_len)
+        elif pos_encoding_layer == "SinusoidalPosEmbedding":
+            pos_encoding_layer = SinusoidalPosEmbedding(embed_dim, max_input_len)
+        self.pos_encoding_layer = pos_encoding_layer        
                      
         self.emb = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=embed_dim, padding_idx=embed_padding_idx)
 
@@ -30,8 +45,6 @@ class Model(nn.Module):
         # self.encoder = nn.ModuleList()
         # for i in range(len(num_encoder_layers)):
         #     pass
-        self.num_encoder_layers = num_encoder_layers
-
 
         self.encoder = nn.TransformerEncoder(encoder_layer, num_encoder_layers)
 
@@ -41,7 +54,7 @@ class Model(nn.Module):
 
         self.init_weights()
 
-    def forward(self, x, padding_mask=None, prediction_mask=None):
+    def forward(self, x, padding_mask=None, prediction_mask=None, pre_logits=False, return_attn=False):
         x = self.emb(x)
         if self.pos_encoding_layer is not None:
             x = self.pos_encoding_layer(x)
@@ -53,8 +66,63 @@ class Model(nn.Module):
         if prediction_mask is not None:
             # only need predictions for the masked elements when training
             x = x[prediction_mask]
+        
+        if pre_logits:
+            return x
         x = self.fc_out(x)
         return x
+
+
+    def get_embeddings(self, selfies=None, smiles=None, return_attn=False, encoder_layer=None, mean_reduce=True):
+        assert bool(selfies) != bool(smiles)
+        is_smiles = bool(smiles)
+
+        if encoder_layer is not None:
+            raise NotImplementedError("TODO: return embedding at specific layer")
+        if return_attn:
+            raise NotImplementedError("TODO")
+
+        x = selfies or smiles
+        if isinstance(x, str):
+            x = [x]
+        
+        def _enc(s):
+            if is_smiles:
+                s = sf.encoder(s)
+            s = list(sf.split_selfies(s))
+            s = self.vocab(s)
+            return s
+        x = [_enc(s) for s in x]
+        
+        if len(x) > 1:
+            # generate padding mask
+            max_len = max([len(s) for s in x])
+            padding = torch.full((len(x), max_len), False)
+            for i, s in enumerate(x):
+                padding[i, len(s):] = True
+                s.extend([self.embed_padding_idx] * (max_len - len(s)))
+        else:
+            padding = None
+
+        x = torch.LongTensor(x).to(self.emb.weight.device)
+
+        x = self.forward(x, padding_mask=padding, pre_logits=True, return_attn=return_attn)
+
+        def _maybe_reduce(x):
+            if mean_reduce:
+                return x.mean(0)
+            else:
+                return x
+
+        if x.shape[0] == 1:
+            return _maybe_reduce(x[0])
+        else:
+            # remove padding
+            out = []
+            for e, m in zip(x, padding):
+                out.append(_maybe_reduce(e[~m]))
+            return out
+
 
     def step(self, x, y, mask, padding, loss_fn, device):
         x = x.to(device, non_blocking=True)
@@ -84,6 +152,33 @@ class Model(nn.Module):
         # if isinstance(module, MultiheadAttention):
         #     module.reset_parameters()
 
+
+    @staticmethod
+    def load_model(filename):
+        state_dict = torch.load(filename)
+        vocab = state_dict['vocab']
+        model_config = state_dict['model_config']
+        model = Model(vocab, **model_config)
+
+        params_dict = state_dict['params_dict']
+        model.load_state_dict(params_dict)
+        return model
+    
+
+    def save_model(self, filename):
+        model_config = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+        del model_config['training']
+        if "pos_encoding_layer" not in model_config or isinstance(model_config["pos_encoding_layer"], nn.Module):
+            model_config["pos_encoding_layer"] = self.pos_encoding_layer.__class__.__name__
+            model_config["max_input_len"] = self.pos_encoding_layer.pos.shape[0]
+
+        save_dict = {
+            "params_dict": self.state_dict(),
+            "vocab": self.vocab,
+            "model_config": model_config
+        }
+
+        torch.save(save_dict, filename)
 
 
 class TrainablePosEmbedding(nn.Module):

@@ -45,7 +45,7 @@ def train():
     
     train_loader, val_loader, vocab, tokens = get_dataloaders(config.dataset_path, 
                                                       train_args=dict(num_workers=config.num_workers, batch_size=batch_size, pin_memory=config.n_gpu > 0),
-                                                      test_args=dict(num_workers=8, batch_size=config.eval_batch_size), distributed=config.n_gpu > 1)
+                                                      test_args=dict(num_workers=2, batch_size=config.eval_batch_size), distributed=config.n_gpu > 1)
 
     model = Model(vocab, 
                   embed_dim=config.embed_dim,
@@ -59,9 +59,9 @@ def train():
     
     # print(model)
     print(f"{sum(p.numel() for p in model.parameters() if p.requires_grad):,} parameters")
-    if config.n_gpu < 2:
+    # if config.n_gpu < 2:
         # TODO compile not working with DDP, maybe related to dynamic batch sizes
-        model = torch.compile(model, dynamic=True)
+        # model = torch.compile(model, dynamic=True)
     if config.n_gpu > 1:
         model = DDP(model, device_ids=[rank])
         ddp_no_sync = model.no_sync
@@ -206,7 +206,7 @@ def save_model(model):
     #     model_path = os.path.join(model_path, "model.pt")
     if config.save_weights_only:
         print("Saving weights to", model_path)
-        torch.save(model.state_dict(), model_path)
+        model.save_model(model_path)
     else:
         print("Saving model to", model_path)
         torch.save(model, model_path)
