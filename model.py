@@ -50,18 +50,20 @@ class Model(nn.Module):
 
         self.act = nn.GELU()
         self.norm = nn.LayerNorm(embed_dim)
-        self.fc_out = nn.Linear(embed_dim, num_outputs)  # -2 for <pad> and <mask>, +1 for out of vocab
+        self.fc_out = nn.Linear(embed_dim, num_outputs)
 
         self.init_weights()
 
-    def forward(self, x, padding_mask=None, prediction_mask=None, pre_logits=False, return_attn=False):
+    def forward(self, x, padding_mask=None, prediction_mask=None, pre_logits=False):
         x = self.emb(x)
         if self.pos_encoding_layer is not None:
             x = self.pos_encoding_layer(x)
         # rearrange for compatability with multihead attention from torch functional
-        x = rearrange(x, "b t c -> t b c")
+        # x = rearrange(x, "b t c -> t b c")
+        x = x.transpose(0, 1)
         x = self.encoder(x, src_key_padding_mask=padding_mask)
-        x = rearrange(x, "t b c -> b t c")
+        # x = rearrange(x, "t b c -> b t c")
+        x = x.transpose(0, 1)
         x = self.norm(self.act(x))
         if prediction_mask is not None:
             # only need predictions for the masked elements when training
@@ -73,19 +75,16 @@ class Model(nn.Module):
         return x
 
 
-    def get_embeddings(self, selfies=None, smiles=None, return_attn=False, encoder_layer=None, mean_reduce=True):
+    @torch.no_grad()
+    def get_embeddings(self, selfies=None, smiles=None, return_attn=False, encoder_layer: int=None, mean_reduce=True):
         assert bool(selfies) != bool(smiles)
         is_smiles = bool(smiles)
-
-        if encoder_layer is not None:
-            raise NotImplementedError("TODO: return embedding at specific layer")
-        if return_attn:
-            raise NotImplementedError("TODO")
 
         x = selfies or smiles
         if isinstance(x, str):
             x = [x]
         
+        # convert inputs to embedding indices
         def _enc(s):
             if is_smiles:
                 s = sf.encoder(s)
@@ -106,7 +105,22 @@ class Model(nn.Module):
 
         x = torch.LongTensor(x).to(self.emb.weight.device)
 
-        x = self.forward(x, padding_mask=padding, pre_logits=True, return_attn=return_attn)
+        # forward pass up to encoder_layer
+        x = self.emb(x)
+        if self.pos_encoding_layer is not None:
+            x = self.pos_encoding_layer(x)
+        x = rearrange(x, "b t c -> t b c")
+        if encoder_layer:
+            if abs(encoder_layer) >= len(self.encoder.layers):
+                raise ValueError(f"invalid 'encoder_layer' argument for model with {len(self.encoder.layers)} encoder layers")
+            # if encoder_layer >= 0:
+            #     encoder_layer += 1
+        else:
+            encoder_layer = len(self.encoder.layers)
+        for layer in self.encoder.layers[:encoder_layer]:
+            x, attn = layer(x, return_head_weights=True, src_key_padding_mask=padding)
+        x = rearrange(x, "t b c -> b t c")
+        attn = rearrange(attn, "h b t s -> b h t s")
 
         def _maybe_reduce(x):
             if mean_reduce:
@@ -115,13 +129,18 @@ class Model(nn.Module):
                 return x
 
         if x.shape[0] == 1:
-            return _maybe_reduce(x[0])
+            x = _maybe_reduce(x[0])
         else:
             # remove padding
             out = []
             for e, m in zip(x, padding):
                 out.append(_maybe_reduce(e[~m]))
-            return out
+            x = out
+        
+        if return_attn:
+            return x, attn
+        else:
+            return x
 
 
     def step(self, x, y, mask, padding, loss_fn, device):
@@ -310,14 +329,19 @@ class MultiheadAttention(nn.Module):
 
     def forward(self, query, key, value,
         key_padding_mask=None, attn_mask=None, 
-        need_weights=True, before_softmax=False, need_head_weights=False,
+        return_attn_weights=False, before_softmax=False, return_head_weights=False,
     ):
-        if need_head_weights:
-            need_weights = True
+        """
+        :param return_attn_weights: return the attention weights averaged over heads
+        :param return_head_weights: return the attention weights for each head
+        :param before_softmax: return the attention weights and values before the attention softmax
+        """
+        if return_head_weights:
+            return_attn_weights = True
 
         tgt_len, bsz, embed_dim = query.size()
 
-        if not (self.rot_emb or need_head_weights):
+        if not (self.rot_emb or return_head_weights):
             return F.multi_head_attention_forward(
                 query,
                 key,
@@ -334,7 +358,7 @@ class MultiheadAttention(nn.Module):
                 self.out_proj.bias,
                 self.training,
                 key_padding_mask,
-                need_weights,
+                return_attn_weights,
                 attn_mask,
                 use_separate_proj_weight=True,
                 q_proj_weight=self.q_proj.weight,
@@ -368,6 +392,7 @@ class MultiheadAttention(nn.Module):
         q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
         v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        #print(f"{q.shape=} {k.shape=} {v.shape=}")
 
         src_len = k.size(1)
 
@@ -420,14 +445,13 @@ class MultiheadAttention(nn.Module):
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
         attn_weights=None
-        if need_weights:
+        if return_attn_weights:
             attn_weights = attn_weights_float.view(
                 bsz, self.num_heads, tgt_len, src_len
             ).type_as(attn).transpose(1, 0)
-            if not need_head_weights:
+            if not return_head_weights:
                 # average attention weights over heads
                 attn_weights = attn_weights.mean(dim=0)
-
         return attn, attn_weights
     
 
@@ -441,7 +465,7 @@ class EncoderLayer(nn.Module):
         nhead,
         attn_dropout=0.1,
         fc_dropout=0.1,
-        add_bias_kv=True,
+        add_bias_kv=False,
         use_rotary_embeddings: bool = False,
     ):
         super().__init__()
@@ -467,7 +491,7 @@ class EncoderLayer(nn.Module):
         self.fc_dropout2 = nn.Dropout(fc_dropout)
         self.fc2 = nn.Linear(self.dim_feedforward, self.d_model)
 
-    def forward(self, x, src_mask=None, src_key_padding_mask=None, need_head_weights=False, is_causal=None):
+    def forward(self, x, src_mask=None, src_key_padding_mask=None, return_head_weights=False, is_causal=None):
         residual = x
         x = self.self_attn_layer_norm(x)
         x, attn = self.self_attn(
@@ -475,8 +499,8 @@ class EncoderLayer(nn.Module):
             key=x,
             value=x,
             key_padding_mask=src_key_padding_mask,
-            need_weights=True,
-            need_head_weights=need_head_weights,
+            return_attn_weights=True,
+            return_head_weights=return_head_weights,
             attn_mask=src_mask,
         )
         x = residual + x
@@ -489,4 +513,7 @@ class EncoderLayer(nn.Module):
         x = self.fc2(x)
         x = residual + x
 
-        return x
+        if return_head_weights:
+            return x, attn
+        else:
+            return x

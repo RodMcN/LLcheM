@@ -117,7 +117,7 @@ def parse_selfies_file(file):
     return selfies
 
 
-def load_zinc20_smiles(datapath=None, train_split=0.9, dev=True):
+def load_zinc20_smiles(datapath=None, train_split=0.9, dev=True, max_len=None):
     # shuffle based on zinc20 tranche.
     # molecules from same tranche are in same train/test split
     files = list(Path(datapath).rglob("*.txt"))
@@ -136,8 +136,13 @@ def load_zinc20_smiles(datapath=None, train_split=0.9, dev=True):
     def load_files(files):
         rows = []
         with Pool(processes=min(os.cpu_count() // 2, 32, len(files))) as p:
-            for i, r in enumerate(p.imap(parse_selfies_file, files), 1):
-                rows.extend(r)
+            for i, r in enumerate(p.imap_unordered(parse_selfies_file, files), 1):
+                if max_len:
+                    for x in r:
+                        if len(x) <= max_len:
+                            rows.append(x)
+                else:
+                    rows.extend(r)
                 print(f"\r{i}/{len(files)}", end="")
         print()
         return rows
@@ -181,7 +186,6 @@ def get_vocab(x: list, specials: list, min_freq: int = 10):
     token_freqs = OrderedDict(item for item in token_freqs.items() if item[1] >= min_freq)
     
     vocab = make_vocab(token_freqs, specials=specials, special_first=False, min_freq=10)
-    vocab.set_default_index(len(vocab))
 
     for idx, token in enumerate(token_freqs):
         assert vocab[token] == idx
