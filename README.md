@@ -36,9 +36,9 @@ Using LLcheM and ESM2, predict binding affinities of proteins and ligands.
 ### Will-it-Bind Lite
 Embedded sequences (amino acids and SELFIES) are averaged across sequence dim and concatenated, a fully connected MLP is used to predict affinities
 
-![Will tt bind - Lite](https://raw.githubusercontent.com/RodMcN/media/main/LLcheM/willitbind_lite.png)
+![Will it bind - Lite](https://raw.githubusercontent.com/RodMcN/media/main/LLcheM/willitbind_lite.png)
 
 ### Will-it-Bind X
 A transformer using cross attention on the embedded sequences to predict binding affinity
 
-![Alt text](image.png)
+![Will it bind - X](https://raw.githubusercontent.com/RodMcN/media/main/LLcheM/willitbind_x.png)
