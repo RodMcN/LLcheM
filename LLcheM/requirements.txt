@@ -1,0 +1,6 @@
+torchtext
+einops==0.6.1
+selfies==2.1.1
+tensorboard
+wandb
+lmdb

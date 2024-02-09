@@ -1,0 +1,2 @@
+optuna==3.5
+scikit-learn==1.3
